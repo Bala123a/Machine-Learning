@@ -1,0 +1,63 @@
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from scipy import stats
+
+# Load data
+data = pd.read_csv('', encoding='latin1')
+# Display the columns
+print("Columns:", data.columns.tolist())
+
+# Set up the matplotlib figure
+fig, axes = plt.subplots(4, 4, figsize=(18, 16))  # Increased grid size to 3x3
+fig.tight_layout(pad=5.0)
+axes = axes.flatten()
+
+# Mapping dictionary: dataframe column -> pretty name
+rename_dict = {
+    
+}
+
+# Variables to plot
+variables = [] # Corrected variable name to Windspeed
+
+# Plot each variable
+for i, var in enumerate(variables):
+    ax = axes[i]
+    plot_data = data[['Fire', var]].dropna()
+
+    if len(plot_data) > 1:
+        x = plot_data['Fire']
+        y = plot_data[var]
+
+        # Perform linear regression
+        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+        r2 = r_value ** 2
+
+        # Plot regression line
+        sns.regplot(x=x, y=y, ax=ax,
+                    scatter_kws={'s': 70, 'color': 'grey'},
+                    line_kws={'color': 'red'})
+
+        # Labels
+        ax.set_xlabel(rename_dict['Fire'], fontsize=12)
+        ax.set_ylabel(rename_dict[var], fontsize=12)
+
+        # Add R² and p-value annotation
+        ax.text(0.05, 0.95, f"$R^2$ = {r2:.2f}\n$p$ = {p_value:.3e}",
+                transform=ax.transAxes,
+                fontsize=11,
+                verticalalignment='top',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.6))
+
+    else:
+        ax.text(0.5, 0.5, "Insufficient data to plot",
+                horizontalalignment='center', verticalalignment='center',
+                transform=ax.transAxes, fontsize=12)
+
+# Hide any unused subplots (if grid larger than number of variables)
+for j in range(len(variables), len(axes)):
+    fig.delaxes(axes[j])
+
+plt.show()
