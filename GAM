@@ -1,0 +1,344 @@
+# =============================================================
+# GENERALIZED ADDITIVE MODEL (GAM) VERSION OF YOUR FULL PIPELINE
+# =============================================================
+
+import pandas as pd
+import numpy as np
+import rasterio
+!pip install rioxarray
+import rioxarray
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve, auc, accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from imblearn.over_sampling import SMOTE
+import xarray as xr
+from sklearn.utils import resample
+!pip install pygam
+from pygam import LogisticGAM, s
+import os # Import os module to check for file existence
+from google.colab import drive # Import drive to check mount status
+
+# =============================================================
+# 0. Mount Google Drive (if not already mounted)
+# =============================================================
+# Check if Google Drive is mounted, if not, mount it
+if not os.path.exists('/content/drive'):
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+else:
+    print("Google Drive is already mounted.")
+
+# =============================================================
+# 1. Load raster predictors
+# =============================================================
+
+raster_files = [
+]
+
+band_names = []
+
+rasters = []
+meta = None
+for file in raster_files:
+    # Check if file exists before trying to open it
+    if not os.path.exists(file):
+        raise FileNotFoundError(f"File not found: {file}. Please check the path and ensure Google Drive is mounted correctly.")
+
+    with rasterio.open(file) as src:
+        if meta is None:
+            meta = src.meta.copy()
+        rasters.append(rioxarray.open_rasterio(file))
+
+first_raster = rasters[0]
+for i, raster in enumerate(rasters[1:], 1):
+    if raster.shape != first_raster.shape or raster.rio.crs != first_raster.rio.crs:
+        raise ValueError("Raster mismatch error")
+
+stacked = xr.concat(rasters, dim="band").transpose("y", "x", "band")
+
+# =============================================================
+# 2. Load training points
+# =============================================================
+
+points_file_path = ""
+if not os.path.exists(points_file_path):
+    raise FileNotFoundError(f"File not found: {points_file_path}. Please check the path and ensure Google Drive is mounted correctly.")
+
+points = pd.read_csv(points_file_path)
+points = gpd.GeoDataFrame(points,
+                          geometry=gpd.points_from_xy(points.longitude, points.latitude),
+                          crs="EPSG:4326")
+points = points.to_crs(stacked.rio.crs)
+
+coords = [(x, y) for x, y in zip(points.geometry.x, points.geometry.y)]
+samples = [list(stacked.sel(x=x, y=y, method="nearest").values) for x, y in coords]
+
+X = np.array(samples)
+y = points["Forest_fir"].values
+
+mask_valid = ~np.isnan(X).any(axis=1)
+X, y = X[mask_valid], y[mask_valid]
+
+# =============================================================
+# 3. Train/Test split
+# =============================================================
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, stratify=y, random_state=42
+)
+
+# =============================================================
+# 4. LASSO Feature Selection
+# =============================================================
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+lasso = LogisticRegression(penalty='l1', solver='liblinear', random_state=42)
+lasso.fit(X_train_scaled, y_train)
+
+selected_features = np.where(lasso.coef_[0] != 0)[0]
+if len(selected_features) == 0:
+    selected_features = np.arange(X_train.shape[1])
+
+X_train_sel = X_train[:, selected_features]
+X_test_sel = X_test[:, selected_features]
+selected_band_names = [band_names[i] for i in selected_features]
+
+# =============================================================
+# 5. SMOTE Oversampling
+# =============================================================
+
+smote = SMOTE(random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train_sel, y_train)
+
+# =============================================================
+# 6. Correlation Matrix
+# =============================================================
+
+df_corr = pd.DataFrame(X_train_res, columns=selected_band_names)
+df_corr["Forest_fir"] = y_train_res
+corr_matrix = df_corr.corr()
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(corr_matrix, annot=True, cmap="coolwarm")
+plt.title("Pearson Correlation Matrix")
+plt.show()
+
+# =============================================================
+# 7. Train GAM (Logistic Regression GAM)
+# =============================================================
+
+# Dynamically build GAM terms based on the number of selected features
+# This creates a TermList object as required by pyGAM
+gam_terms_base = sum(s(i) for i in range(X_train_res.shape[1]))
+
+# Optuna objective function
+def objective(trial):
+    # bounds chosen to be reasonable for low-dim predictor sets
+    n_splines = trial.suggest_int("n_splines", 8, 40)
+    lam = trial.suggest_float("lam", 1e-3, 1e2, log=True)
+
+    # Dynamically build GAM terms for the objective function
+    gam_terms_tuned_list = [s(i, n_splines=n_splines, lam=lam) for i in range(X_train_res.shape[1])]
+    gam_terms_tuned = sum(gam_terms_tuned_list)
+
+    gam = LogisticGAM(
+        terms=gam_terms_tuned,
+        max_iter=300,
+        verbose=False
+    )
+
+    try:
+        gam.fit(X_train_res, y_train_res)
+        y_prob_val = gam.predict_proba(X_test_sel)  # returns prob for class 1
+        score = roc_auc_score(y_test, y_prob_val)
+    except Exception as e:
+        # If fitting fails (rare), give a low score
+        print(f"Optuna trial failed: {e}")
+        score = 0.0
+    return score
+
+n_trials = 5
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+print("Optuna best params:", study.best_params)
+best_params = study.best_params
+
+# Fit final GAM using best params
+final_gam_terms_list = [
+    s(i, n_splines=best_params.get("n_splines", 20), lam=best_params.get("lam", 1.0))
+    for i in range(X_train_res.shape[1])
+]
+final_gam_terms = sum(final_gam_terms_list)
+
+best_gam = LogisticGAM(
+    terms=final_gam_terms,
+    max_iter=800,
+    verbose=False
+)
+
+print("Training final GAM...")
+best_gam.fit(X_train_res, y_train_res)
+
+# Save model
+joblib.dump(best_gam, model_save_path)
+print(f"Saved trained GAM to {model_save_path}")
+
+# =============================================================
+# 8. Evaluation
+# =============================================================
+
+y_prob = best_gam.predict_proba(X_test_sel)
+y_pred = (y_prob > 0.5).astype(int)
+
+accuracy = accuracy_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred)
+recall = recall_score(y_test, y_pred)
+f1 = f1_score(y_test, y_pred)
+roc_auc = roc_auc_score(y_test, y_prob)
+
+print("Accuracy:", accuracy)
+print("Precision:", precision)
+print("Recall:", recall)
+print("F1:", f1)
+print("ROC-AUC:", roc_auc)
+
+# Bootstrap uncertainty
+boot = []
+for _ in range(100):
+    X_b, y_b = resample(X_test_sel, y_test)
+    p_b = best_gam.predict_proba(X_b)
+    boot.append(roc_auc_score(y_b, p_b))
+
+print("Uncertainty (AUC Std):", np.std(boot))
+
+# -------- ROC Curve Plot --------
+fpr, tpr, _ = roc_curve(y_test, y_prob)
+
+plt.figure(figsize=(7, 6))
+plt.plot(fpr, tpr, linewidth=2)
+plt.plot([0, 1], [0, 1], 'k--')
+plt.title("ROC Curve - GAM Model")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.grid(True)
+plt.show()
+
+
+# =============================================================
+# 9. Apply GAM to full raster
+# =============================================================
+
+rows, cols, bands = stacked.shape
+X_all = stacked.values.reshape(-1, bands)
+X_all_sel = X_all[:, selected_features]
+
+imp = SimpleImputer(strategy="mean")
+X_all_imp = imp.fit_transform(X_all_sel)
+
+probs = best_gam.predict_proba(X_all_imp)
+susceptibility = probs.reshape(rows, cols)
+
+# =============================================================
+# 10. Save Raster
+# =============================================================
+
+out_meta = meta.copy()
+out_meta.update({
+    "count": 1,
+    "dtype": "float32"
+})
+
+with rasterio.open("GAM_Fire_Susceptibility.tif", "w", **out_meta) as dst:
+    dst.write(susceptibility.astype("float32"), 1)
+
+print("Saved: GAM_Fire_Susceptibility.tif")
+# ====================================================
+# 11. Export maps (use original profile; single band float32)
+# ====================================================
+out_profile = meta.copy() # Use meta from raster loading
+out_profile.update(
+    dtype='float32',
+    count=1,
+    compress='lzw'
+)
+
+def write_raster(path, array, profile=out_profile):
+    with rasterio.open(path, 'w', **profile) as dst:
+        dst.write(array.astype('float32'), 1)
+    print(f"Wrote {path}")
+
+# Define pred_map, prob_map, unc_map for section 11 export
+# pred_map will be the binary prediction (0 or 1)
+pred_map = (susceptibility > 0.5).astype("float32")
+# prob_map is the susceptibility map itself (probabilities)
+prob_map = susceptibility.astype("float32")
+# unc_map will be calculated based on probabilities, e.g., entropy
+from scipy.stats import entropy
+unc_map = entropy(np.vstack([1-susceptibility.flatten(), susceptibility.flatten()]), base=2).reshape(rows, cols).astype("float32")
+
+write_raster(out_pred_path, pred_map, profile=out_profile)
+write_raster(out_prob_path, prob_map, profile=out_profile)
+write_raster(out_unc_path, unc_map, profile=out_profile)
+
+print("All outputs written:")
+print(" -", out_pred_path)
+print(" -", out_prob_path)
+print(" -", out_unc_path)
+# ====================================================
+# 12. SHAP Summary Bar Plot (Global Feature Importance)
+# ====================================================
+# The variables shap_values and X_train are not defined in this context for GAM models.
+# SHAP for pyGAM requires specific explainers or a different approach.
+# Commenting out SHAP related code to avoid errors.
+# plt.figure(figsize=(10, 6))
+# shap.summary_plot(
+#     shap_values,
+#     X_train,
+#     plot_type="bar",
+#     feature_names=selected_band_names
+# )
+# plt.savefig("SHAP_BarPlot.png", dpi=300, bbox_inches="tight")
+# plt.close()
+
+# ====================================================
+# 12B. SHAP Beeswarm Plot (Distribution of Impacts)
+# ====================================================
+# plt.figure(figsize=(10, 6))
+# shap.summary_plot(
+#     shap_values,
+#     X_train,
+#     feature_names=selected_band_names
+# )
+# plt.savefig("SHAP_Beeswarm.png", dpi=300, bbox_inches="tight")
+# plt.close()
+
+# ====================================================
+# 8C. SHAP Dependence Plot for Most Important Feature
+# ====================================================
+# Identify most important feature
+# import numpy as np
+
+# mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+# top_feature_index = np.argmax(mean_abs_shap)
+# top_feature_name = selected_band_names[top_feature_index]
+
+# plt.figure(figsize=(10, 6))
+# shap.dependence_plot(
+#     top_feature_index,
+#     shap_values,
+#     X_train,
+#     feature_names=selected_band_names
+# )
+# plt.savefig("SHAP_Dependence_TopFeature.png", dpi=300, bbox_inches="tight")
+# plt.close()
+
+print("SHAP analysis completed. Plots exported.")
